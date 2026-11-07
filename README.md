@@ -209,3 +209,28 @@ items.
 | `src/manifest.js` | Addon manifest (custom `audiobook` type, search catalog) |
 | `src/config.js` | Packs the API key into the install URL |
 | `test/parse.test.js` | Unit tests for the pure logic |
+
+## Private browser listening (Pi fork, 3.3.0)
+
+Open `/listen/` to search and listen without Stremio. The browser reuses the same
+TorBox resolver and file playlist API. Enter a TorBox key or paste your existing
+manifest link in **Connect TorBox**. Keys stay in tab memory; POST bodies carry
+them to the backend, not page URLs or browser storage. Reloading clears the key.
+Playback progress is kept locally on the device. TorBox serves audio directly;
+the Pi does not download audiobook files.
+
+Set `PUBLIC_SOURCES=knaben,tpb,torrentscsv` to enable all three public adapters.
+Knaben searches its audiobook category with 100-result pages and **Load more**.
+The Pirate Bay is restricted to audio books (category 102). Torrents.csv has no
+categories, so only explicitly labelled audiobook releases are retained. All
+three are searched concurrently, deduplicated by infohash, and report failures
+separately. They are overlapping indexes, not a guarantee of every release.
+`ABB_ENABLED=0` disables AudiobookBay even for old install links. Existing
+Jackett integration remains available for sources requiring private accounts.
+
+Public API contracts: [Knaben](https://github.com/knaben-database/knaben-api),
+[Torrents.csv](https://codeberg.org/heretic/torrents-csv-server).
+
+Search results are torrent listings, not a promise of cached audio. With a key,
+cached results are marked; selecting an uncached book can require TorBox to
+prepare it. Archived releases without playable audio files cannot stream.

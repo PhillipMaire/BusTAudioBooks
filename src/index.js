@@ -14,6 +14,10 @@ const { createCatalogPager } = require("./catalog");
 const torbox = require("./torbox");
 
 const app = express();
+const path = require('path');
+const { enabledSources, NAMES } = require('./publicSources');
+app.disable('x-powered-by');
+app.use(express.json({ limit: '24kb' }));
 const PORT = process.env.PORT || 7000;
 const access = makeAccess(); // shared-token gate (off unless ACCESS_TOKENS set)
 
@@ -46,7 +50,7 @@ function isInstantOnly(cfg) {
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -69,8 +73,8 @@ function prettyName(raw) {
 
 // Read & validate the per-user config from the URL path segment.
 function getConfig(req, res) {
-  const cfg = decodeConfig(req.params.config);
-  if (!cfg || !cfg.apiKey) {
+  const cfg = req.method === "POST" ? req.body?.config : decodeConfig(req.params.config);
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg) || (req.path !== "/api/search" && (typeof cfg.apiKey !== "string" || !cfg.apiKey.trim()))) {
     res.status(400).json({ err: "Missing or invalid configuration. Re-install the addon." });
     return null;
   }
@@ -78,7 +82,7 @@ function getConfig(req, res) {
     res.status(403).json({ err: "Invalid or missing access token for this instance." });
     return null;
   }
-  return cfg;
+  return { ...cfg, apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : "" };
 }
 
 // ---- Configure page (landing) ----------------------------------------------
@@ -194,14 +198,22 @@ if (window.__requireToken) {
 
 function sendConfigure(_req, res) {
   const serverSearch =
-    (!!process.env.JACKETT_URL && !!process.env.JACKETT_API_KEY) || !!process.env.ABB_DOMAIN;
+    (!!process.env.JACKETT_URL && !!process.env.JACKETT_API_KEY) || (!!process.env.ABB_DOMAIN && process.env.ABB_ENABLED !== "0") || enabledSources().length > 0;
   const flag =
     `<script>window.__serverSearch=${serverSearch ? "true" : "false"};` +
     `window.__requireToken=${access.required ? "true" : "false"};</script>`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(CONFIGURE_HTML.replace("</head>", `${flag}</head>`));
 }
-app.get("/", (_req, res) => res.redirect("/configure"));
+app.get("/", (_req, res) => res.redirect("/listen"));
+app.use('/listen', express.static(path.join(__dirname, 'web'), { setHeaders: (res, filePath) => {
+  res.type(path.extname(filePath));
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: data:; media-src https: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+} }));
+app.get('/api/sources', (_req, res) => res.json({ sources: enabledSources().map(id => ({ id, name: NAMES[id] })), requireToken: access.required }));
+app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); res.setHeader('Referrer-Policy', 'no-referrer'); next(); });
 app.get("/configure", sendConfigure);
 // Stremio opens /<config>/configure for re-configuration.
 app.get("/:config/configure", sendConfigure);
@@ -223,6 +235,7 @@ async function runSearch(cfg, query, page, { enrichResults = true, deferDetails 
   const cacheKey = crypto.createHash('sha256').update(JSON.stringify([
     cfg.abbDomain || process.env.ABB_DOMAIN || '', effJackett,
     cfg.jackettApiKey || process.env.JACKETT_API_KEY || '', cfg.apiKey,
+    process.env.PUBLIC_SOURCES || '', cfg.sources, process.env.ABB_ENABLED,
     instantOnly, query, page, deferDetails,
   ])).digest('hex');
   // The cache holds the expensive part (sources + TorBox cache check) without
@@ -235,11 +248,12 @@ async function runSearch(cfg, query, page, { enrichResults = true, deferDetails 
   let results = await searchAudiobooks(cfg, query, page, { deferDetails });
   const partial = !!results.partial;
   const hasMore = results.hasMore === true;
+  const statuses = results.statuses || [];
 
   let cachedSet = new Set();
   try {
     const hashes = results.map((r) => r.infohash).filter(Boolean);
-    if (hashes.length) cachedSet = await torbox.checkCachedMany(cfg.apiKey, hashes);
+    if (hashes.length && cfg.apiKey) cachedSet = await torbox.checkCachedMany(cfg.apiKey, hashes);
   } catch (_) {
     /* non-critical */
   }
@@ -257,7 +271,7 @@ async function runSearch(cfg, query, page, { enrichResults = true, deferDetails 
   });
 
   const found = results.map((r) => ({ ...r, cached: !!(r.infohash && cachedSet.has(r.infohash)) }));
-  Object.assign(found, { hasMore, partial });
+  Object.assign(found, { hasMore, partial, statuses });
   // Partial results (one source failed) are kept only briefly.
   searchCache.set(cacheKey, found, partial ? 30 * 1000 : undefined);
   return enrichResults ? enrichWithin(found, ENRICH_BUDGET_MS) : found;
@@ -279,7 +293,7 @@ async function enrichWithin(items, budgetMs) {
     })()
   );
   await withTimeout(Promise.all(lookups), budgetMs, undefined);
-  return out.slice();
+  return Object.assign(out.slice(), { hasMore: items.hasMore, partial: items.partial, statuses: items.statuses });
 }
 
 // ---- Catalog (search only) --------------------------------------------------
@@ -429,23 +443,27 @@ app.get("/:config/stream/:type/:id.json", async (req, res) => {
 // Simple, app-friendly endpoints backed by the same search + TorBox logic.
 
 // GET /:config/app/search?q=...&page=1
-app.get("/:config/app/search", async (req, res) => {
+async function handleAppSearch(req, res) {
   const cfg = getConfig(req, res);
   if (!cfg) return;
-  const query = String(req.query.q || "").trim();
-  if (!query) return res.json({ results: [] });
-  const page = parseInt(req.query.page, 10) || 1;
+  const input = req.method === "POST" ? req.body : req.query;
+  const query = String(input.q || "").trim().slice(0, 250);
+  if (!query) return res.json({ results: [], hasMore: false, sources: [] });
+  const page = Math.max(1, Math.min(100, parseInt(input.page, 10) || 1));
   if (req.query.type === "comic") return comicsGone(res, { results: [] });
 
   let items;
   try {
-    items = await runSearch(cfg, query, page);
+    items = await runSearch(cfg, query, page, { enrichResults: req.method !== "POST" });
   } catch (err) {
     console.error("app search error:", err.message);
     const unavailable = err.name === "SearchUnavailableError";
     return res.status(unavailable ? 503 : 502).json({ results: [], error: unavailable ? err.message : "Search failed on the server" });
   }
   res.json({
+    hasMore: items.hasMore === true,
+    partial: !!items.partial,
+    sources: items.statuses || [],
     results: items.map((r) => ({
       id: encodeItemId(r),
       type: "audiobook",
@@ -456,10 +474,15 @@ app.get("/:config/app/search", async (req, res) => {
       bitrate: r.bitrate || null,
       size: r.size || 0,
       sizeText: torbox.formatBytes(r.size) || null,
+      source: r.tracker || null,
+      infohash: r.infohash || null,
+      seeders: r.seeders || 0,
       cached: !!r.cached,
     })),
   });
-});
+}
+app.get("/:config/app/search", handleAppSearch);
+app.post("/api/search", handleAppSearch);
 
 // Comic chapter/page routes of app versions before 3.0.
 app.get(["/:config/app/chapters/:id", "/:config/app/pages/:chapterId"], (req, res) => {
@@ -468,10 +491,10 @@ app.get(["/:config/app/chapters/:id", "/:config/app/pages/:chapterId"], (req, re
 });
 
 // GET /:config/app/streams/:id  -> playable files for a book
-app.get("/:config/app/streams/:id", async (req, res) => {
+async function handleAppStreams(req, res) {
   const cfg = getConfig(req, res);
   if (!cfg) return;
-  const item = decodeItemId(req.params.id);
+  const item = decodeItemId(req.method === "POST" ? req.body?.id : req.params.id);
   if (!item) return res.status(400).json({ ready: false, streams: [], status: "Bad item id" });
   if (item.legacyComic) return comicsGone(res, { ready: false, streams: [], status: COMICS_REMOVED });
 
@@ -496,7 +519,9 @@ app.get("/:config/app/streams/:id", async (req, res) => {
     console.error("app streams error:", err.message);
     return res.status(502).json({ ready: false, streams: [], status: err.message });
   }
-});
+}
+app.get("/:config/app/streams/:id", handleAppStreams);
+app.post("/api/streams", handleAppStreams);
 
 // GET /:config/app/details/:id -> synopsis, genre and year for the book page.
 // Best-effort and cached; every field may be null.
@@ -561,9 +586,10 @@ async function handleHealth(req, res) {
       (cfg.jackettApiKey || process.env.JACKETT_API_KEY)
     );
     out.sources = {
-      audiobookbay: !!(cfg.abbDomain || process.env.ABB_DOMAIN),
+      audiobookbay: process.env.ABB_ENABLED !== "0" && !!(cfg.abbDomain || process.env.ABB_DOMAIN),
+      public: enabledSources(cfg).map(id => NAMES[id]),
       jackett: hasJackett,
-      serverProvided: !!(process.env.JACKETT_URL && process.env.JACKETT_API_KEY) || !!process.env.ABB_DOMAIN,
+      serverProvided: !!(process.env.JACKETT_URL && process.env.JACKETT_API_KEY) || (process.env.ABB_ENABLED !== "0" && !!process.env.ABB_DOMAIN) || enabledSources(cfg).length > 0,
     };
     out.abbDomain = cfg.abbDomain || process.env.ABB_DOMAIN || null;
     out.instantOnly = isInstantOnly(cfg);

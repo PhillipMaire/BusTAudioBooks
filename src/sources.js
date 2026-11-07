@@ -10,6 +10,7 @@
 //
 // `searchAudiobooks(config, query)` is the only function index.js calls.
 
+const { enabledSources, searchPublic, NAMES } = require('./publicSources');
 const { TTLCache, pLimit, withRetry } = require("./cache");
 
 const BROWSER_UA =
@@ -80,6 +81,7 @@ function qualityScore(item) {
 // configurable (per-user in the configure page, or via the ABB_DOMAIN env var)
 // so you can point at the current working one without editing code.
 function abbDomain(config) {
+  if (process.env.ABB_ENABLED === "0") return null;
   const raw = (config.abbDomain || process.env.ABB_DOMAIN || "").trim();
   if (!raw) return null;
   return raw.replace(/^https?:\/\//, "").replace(/\/+$/, "");
@@ -366,22 +368,25 @@ async function runSources(sources) {
   const settled = await Promise.allSettled(sources.map(([, run]) => run()));
   const items = [];
   const failures = [];
+  const statuses = [];
   let hasMore = false;
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") {
       items.push(...r.value);
+      statuses.push({ name: sources[i][0], status: "ok", count: r.value.length });
       hasMore ||= r.value.hasMore === true;
     }
     else {
       const reason = (r.reason && r.reason.message) || "failed";
       console.error(`${sources[i][0]} search failed:`, reason);
       failures.push(`${sources[i][0]}: ${reason}`);
+      statuses.push({ name: sources[i][0], status: "unavailable", count: 0 });
     }
   });
   if (failures.length > 0 && failures.length === sources.length) {
     throw new SearchUnavailableError(`Search is unavailable right now — ${failures.join("; ")}`);
   }
-  return { items: dedupeAndSort(items), partial: failures.length > 0, hasMore };
+  return { items: dedupeAndSort(items), partial: failures.length > 0, hasMore, statuses };
 }
 
 // Result arrays carry `partial: true` when some (not all) sources failed, so
@@ -389,15 +394,16 @@ async function runSources(sources) {
 async function searchAudiobooks(config, query, page = 1, options = {}) {
   const abb = !!abbDomain(config);
   const jackett = !!jackettSettings(config);
-  if (!abb && !jackett) {
+  const publicSources = enabledSources(config);
+  if (!abb && !jackett && !publicSources.length) {
     throw new SearchUnavailableError("No search source is set up — add an AudiobookBay domain or Jackett/Prowlarr on the configure page.");
   }
-  const sources = [];
+  const sources = publicSources.map(id => [NAMES[id], () => searchPublic(id, query, page)]);
   if (abb) sources.push(["AudiobookBay", () => searchAudiobookBay(config, query, page, options)]);
   if (jackett && page === 1) sources.push(["Jackett", () => searchJackett(config, query)]);
   if (sources.length === 0) return []; // Jackett-only results aren't paginated
-  const { items, partial, hasMore } = await runSources(sources);
-  return Object.assign(items, { partial, hasMore });
+  const { items, partial, hasMore, statuses } = await runSources(sources);
+  return Object.assign(items, { partial, hasMore, statuses });
 }
 
 
