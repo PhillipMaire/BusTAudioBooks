@@ -10,6 +10,7 @@ const { appRelease } = require("./appRelease");
 const { encodeItemId, decodeItemId } = require("./itemid");
 const { TTLCache, pLimit, withTimeout } = require("./cache");
 const { makeAccess } = require("./access");
+const { createCatalogPager } = require("./catalog");
 const torbox = require("./torbox");
 
 const app = express();
@@ -216,20 +217,24 @@ app.get("/:config/manifest.json", (req, res) => {
 // ---- Shared search (used by both the Stremio catalog and the app API) -------
 // Returns enriched result items: the raw source item plus { poster, author,
 // cached }. Cached per query/page so both consumers share the heavy work.
-async function runSearch(cfg, query, page) {
+async function runSearch(cfg, query, page, { enrichResults = true } = {}) {
   const instantOnly = isInstantOnly(cfg);
   const effJackett = cfg.jackettUrl || process.env.JACKETT_URL || "";
-  const cacheKey = `${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
+  const cacheKey = crypto.createHash('sha256').update(JSON.stringify([
+    cfg.abbDomain || process.env.ABB_DOMAIN || '', effJackett,
+    cfg.jackettApiKey || process.env.JACKETT_API_KEY || '', cfg.apiKey,
+    instantOnly, query, page,
+  ])).digest('hex');
   // The cache holds the expensive part (sources + TorBox cache check) without
   // covers; covers come from their own cache on every call.
   const hit = searchCache.get(cacheKey);
-  if (hit) return enrichWithin(hit, ENRICH_BUDGET_MS);
+  if (hit) return enrichResults ? enrichWithin(hit, ENRICH_BUDGET_MS) : hit;
 
   // Errors (nothing configured, every source down) propagate uncached; the
   // app API reports them, the Stremio catalog shows an empty row.
   let results = await searchAudiobooks(cfg, query, page);
   const partial = !!results.partial;
-  results = results.slice(0, 40);
+  const hasMore = results.hasMore === true;
 
   let cachedSet = new Set();
   try {
@@ -252,10 +257,15 @@ async function runSearch(cfg, query, page) {
   });
 
   const found = results.map((r) => ({ ...r, cached: !!(r.infohash && cachedSet.has(r.infohash)) }));
+  Object.assign(found, { hasMore, partial });
   // Partial results (one source failed) are kept only briefly.
   searchCache.set(cacheKey, found, partial ? 30 * 1000 : undefined);
-  return enrichWithin(found, ENRICH_BUDGET_MS);
+  return enrichResults ? enrichWithin(found, ENRICH_BUDGET_MS) : found;
 }
+
+const catalogPage = createCatalogPager((cfg, query, page) =>
+  runSearch(cfg, query, page, { enrichResults: false })
+);
 
 // Adds { poster, author } to each result, waiting at most `budgetMs`. Results
 // whose lookup hasn't finished go out with the author parsed from the title
@@ -289,16 +299,15 @@ async function handleCatalog(req, res, extraRaw) {
   const query = (extra.search || "").trim();
   if (!query) return res.json({ metas: [] });
 
-  const PAGE_SIZE = 12;
-  const skip = parseInt(extra.skip, 10) || 0;
-  const page = Math.floor(skip / PAGE_SIZE) + 1;
+  const skip = Math.max(0, parseInt(extra.skip, 10) || 0);
 
   let items;
   try {
-    items = await runSearch(cfg, query, page);
+    const rows = await catalogPage(cfg, query, skip);
+    items = await enrichWithin(rows, ENRICH_BUDGET_MS);
   } catch (err) {
     console.error("catalog search error:", err.message);
-    return res.json({ metas: [] });
+    return res.status(503).json({ metas: [], error: 'Search temporarily unavailable' });
   }
   const metas = items.map((r) => ({
     id: encodeItemId(r),

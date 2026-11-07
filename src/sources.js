@@ -204,7 +204,17 @@ async function searchAudiobookBay(config, query, page = 1) {
   // (e.g. a Cloudflare challenge) instead of caching an empty answer.
   const listHtml = await abbFetch(listUrl, listCache);
 
-  const posts = parseAbbList(listHtml, domain).slice(0, 12); // cap detail fetches
+  const posts = parseAbbList(listHtml, domain);
+  // Follow the site's pagination, not the number of usable detail results.
+  // Filtering or a missing hash can make even a middle page look short.
+  const hasMore = [...listHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)].some((match) => {
+    try {
+      const url = new URL(match[1].replace(/&amp;/g, '&'), listUrl);
+      if (url.hostname !== domain) return false;
+      const number = Number(url.pathname.match(/\/page\/(\d+)\/?$/)?.[1] || url.searchParams.get('paged'));
+      return number > page;
+    } catch (_) { return false; }
+  });
 
   const settled = await Promise.allSettled(
     posts.map(async (p) => {
@@ -224,9 +234,10 @@ async function searchAudiobookBay(config, query, page = 1) {
     })
   );
 
-  return settled
+  const results = settled
     .filter((r) => r.status === "fulfilled" && r.value)
     .map((r) => r.value);
+  return Object.assign(results, { hasMore });
 }
 
 // ===========================================================================
@@ -328,8 +339,12 @@ async function runSources(sources) {
   const settled = await Promise.allSettled(sources.map(([, run]) => run()));
   const items = [];
   const failures = [];
+  let hasMore = false;
   settled.forEach((r, i) => {
-    if (r.status === "fulfilled") items.push(...r.value);
+    if (r.status === "fulfilled") {
+      items.push(...r.value);
+      hasMore ||= r.value.hasMore === true;
+    }
     else {
       const reason = (r.reason && r.reason.message) || "failed";
       console.error(`${sources[i][0]} search failed:`, reason);
@@ -339,7 +354,7 @@ async function runSources(sources) {
   if (failures.length > 0 && failures.length === sources.length) {
     throw new SearchUnavailableError(`Search is unavailable right now — ${failures.join("; ")}`);
   }
-  return { items: dedupeAndSort(items), partial: failures.length > 0 };
+  return { items: dedupeAndSort(items), partial: failures.length > 0, hasMore };
 }
 
 // Result arrays carry `partial: true` when some (not all) sources failed, so
@@ -354,8 +369,8 @@ async function searchAudiobooks(config, query, page = 1) {
   if (abb) sources.push(["AudiobookBay", () => searchAudiobookBay(config, query, page)]);
   if (jackett && page === 1) sources.push(["Jackett", () => searchJackett(config, query)]);
   if (sources.length === 0) return []; // Jackett-only results aren't paginated
-  const { items, partial } = await runSources(sources);
-  return Object.assign(items, { partial });
+  const { items, partial, hasMore } = await runSources(sources);
+  return Object.assign(items, { partial, hasMore });
 }
 
 
