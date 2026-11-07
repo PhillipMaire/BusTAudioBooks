@@ -1,5 +1,5 @@
 // Public search adapters; TorBox remains the resolver, not the search engine.
-const { TTLCache } = require('./cache');
+const { TTLCache, withRetry } = require('./cache');
 const pages = new TTLCache(5 * 60 * 1000, 100);
 const PAGE_SIZE = 100;
 const NAMES = { knaben: 'Knaben', tpb: 'The Pirate Bay', torrentscsv: 'Torrents.csv' };
@@ -35,9 +35,11 @@ async function searchPublic(source, query, page = 1) {
   } else if (source === 'torrentscsv') {
     url = 'https://torrents-csv.com/service/search?' + new URLSearchParams({ q: query, size: '100' });
   } else { throw new Error('Unknown public source'); }
-  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`${NAMES[source]} HTTP ${res.status}`);
-  const json = await res.json();
+  const json = await withRetry(async () => {
+    const res = await fetch(url, { ...init, headers: { ...init.headers, 'User-Agent': 'BusTAudioBooks/3.3 (+https://github.com/PhillipMaire/BusTAudioBooks)' }, signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`${NAMES[source]} HTTP ${res.status}`);
+    return res.json();
+  }, { retries: 1, baseDelayMs: 1000 });
   const raw = source === 'knaben' ? json.hits : source === 'tpb' ? json : json.torrents;
   if (!Array.isArray(raw)) throw new Error(`${NAMES[source]} returned an invalid response`);
   const items = raw.filter(r => {

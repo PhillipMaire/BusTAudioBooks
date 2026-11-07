@@ -48,7 +48,7 @@ test('all public sources combine, filter audiobook categories, dedupe hashes, an
     all.push(...rows);
     assert.equal(rows.hasMore, page < 3);
     assert.equal(rows.partial, false);
-    assert.equal(rows.statuses.length, 3);
+    assert.equal(rows.statuses.length, page === 1 ? 3 : 1);
   }
   assert.equal(all.length, 227);
   assert.equal(new Set(all.map(r => r.infohash)).size, 227);
@@ -105,4 +105,13 @@ test('private browser searches without a key, pages fully, and sends playback ke
     assert.ok(!js.includes('innerHTML')); assert.ok(!js.includes('sessionStorage'));
     assert.ok(!js.includes('localStorage.setItem(\'api'));
   } finally { torbox.checkCachedMany = originalCached; torbox.resolveStreams = originalResolve; await new Promise(r => server.close(r)); }
+}));
+
+// One-page providers must not mask an outage in the only active paged source.
+test('a failed later source page stays retryable instead of looking like the catalog end', async () => withEnvironment(async () => {
+  global.fetch = async url => { assert.match(String(url), /api.knaben.org/); throw new Error('temporary outage'); };
+  await assert.rejects(searchAudiobooks({}, 'later-page-outage', 3), { name: 'SearchUnavailableError' });
+  global.fetch = async () => json({ total: { value: 201 }, hits: [{ title: 'Recovered audiobook', hash: hash(900), categoryId: [1003000] }] });
+  const recovered = await searchAudiobooks({}, 'later-page-outage', 3);
+  assert.equal(recovered.length, 1); assert.equal(recovered.hasMore, false);
 }));

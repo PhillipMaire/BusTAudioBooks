@@ -398,7 +398,7 @@ async function searchAudiobooks(config, query, page = 1, options = {}) {
   if (!abb && !jackett && !publicSources.length) {
     throw new SearchUnavailableError("No search source is set up — add an AudiobookBay domain or Jackett/Prowlarr on the configure page.");
   }
-  const sources = publicSources.map(id => [NAMES[id], () => searchPublic(id, query, page)]);
+  const sources = publicSources.filter(id => page === 1 || id === 'knaben').map(id => [NAMES[id], () => searchPublic(id, query, page)]);
   if (abb) sources.push(["AudiobookBay", () => searchAudiobookBay(config, query, page, options)]);
   if (jackett && page === 1) sources.push(["Jackett", () => searchJackett(config, query)]);
   if (sources.length === 0) return []; // Jackett-only results aren't paginated
