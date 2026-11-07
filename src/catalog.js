@@ -1,8 +1,8 @@
 const crypto = require('crypto');
 const { TTLCache } = require('./cache');
 
-// Stremio stops paging on a short response. Source pages are smaller (currently
-// nine ABB books), so retain a stable, deduplicated cursor across source pages.
+// Current Stremio clients advance skip by the actual number returned. Retain
+// a source cursor rather than dividing that offset by an assumed page size.
 function createCatalogPager(fetchPage) {
   const searches = new TTLCache(5 * 60 * 1000, 30);
   return async (cfg, query, skip = 0) => {
@@ -13,10 +13,10 @@ function createCatalogPager(fetchPage) {
       searches.set(key, state);
     }
     const fill = async () => {
-      while (!state.done && state.items.length < skip + 100) {
+      while (!state.done && state.items.length <= skip) {
         const rows = await fetchPage(cfg, query, state.next);
         for (const row of rows) {
-          const id = row.infohash || row.magnet || row.name;
+          const id = row.infohash || row.magnet || row.detailUrl || row.name;
           if (!state.seen.has(id)) {
             state.seen.add(id);
             state.items.push(row);

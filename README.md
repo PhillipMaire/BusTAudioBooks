@@ -1,8 +1,9 @@
 ## Pi deployment fork
 
-This fork fixes Stremio catalog pagination: small source pages are collected
-into 100-item responses, with stable offsets, duplicate removal, cache isolation,
-and recovery after source-page errors. Mobile app source-page behavior remains
+This fork fixes Stremio catalog pagination: small source pages use the actual
+returned offsets, with stable cursors, duplicate removal, cache isolation, and
+recovery after source-page errors. Browsing fetches listing pages only; the
+selected book's download details are resolved on playback. Mobile app source-page behavior remains
 unchanged. Upstream project: https://github.com/AFK-Goblin/BusTAudioBooks.
 
 # BusTAudio — Stremio Audiobook Addon

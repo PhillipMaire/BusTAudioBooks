@@ -3,7 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { manifest } = require("./manifest");
 const { decodeConfig } = require("./config");
-const { searchAudiobooks, qualityScore } = require("./sources");
+const { searchAudiobooks, resolveAudiobookItem, qualityScore } = require("./sources");
 const { enrich, details, parseNameParts } = require("./metadata");
 const { seriesFor, similarFor } = require("./series");
 const { appRelease } = require("./appRelease");
@@ -217,13 +217,13 @@ app.get("/:config/manifest.json", (req, res) => {
 // ---- Shared search (used by both the Stremio catalog and the app API) -------
 // Returns enriched result items: the raw source item plus { poster, author,
 // cached }. Cached per query/page so both consumers share the heavy work.
-async function runSearch(cfg, query, page, { enrichResults = true } = {}) {
+async function runSearch(cfg, query, page, { enrichResults = true, deferDetails = false } = {}) {
   const instantOnly = isInstantOnly(cfg);
   const effJackett = cfg.jackettUrl || process.env.JACKETT_URL || "";
   const cacheKey = crypto.createHash('sha256').update(JSON.stringify([
     cfg.abbDomain || process.env.ABB_DOMAIN || '', effJackett,
     cfg.jackettApiKey || process.env.JACKETT_API_KEY || '', cfg.apiKey,
-    instantOnly, query, page,
+    instantOnly, query, page, deferDetails,
   ])).digest('hex');
   // The cache holds the expensive part (sources + TorBox cache check) without
   // covers; covers come from their own cache on every call.
@@ -232,7 +232,7 @@ async function runSearch(cfg, query, page, { enrichResults = true } = {}) {
 
   // Errors (nothing configured, every source down) propagate uncached; the
   // app API reports them, the Stremio catalog shows an empty row.
-  let results = await searchAudiobooks(cfg, query, page);
+  let results = await searchAudiobooks(cfg, query, page, { deferDetails });
   const partial = !!results.partial;
   const hasMore = results.hasMore === true;
 
@@ -264,7 +264,7 @@ async function runSearch(cfg, query, page, { enrichResults = true } = {}) {
 }
 
 const catalogPage = createCatalogPager((cfg, query, page) =>
-  runSearch(cfg, query, page, { enrichResults: false })
+  runSearch(cfg, query, page, { enrichResults: false, deferDetails: !isInstantOnly(cfg) })
 );
 
 // Adds { poster, author } to each result, waiting at most `budgetMs`. Results
@@ -375,10 +375,11 @@ app.get("/:config/meta/:type/:id.json", async (req, res) => {
 // Returns { ready, status, streams } where streams are raw {title,url,filename,
 // behaviorHints}. Cached per (apiKey, item) so re-opens don't re-hit TorBox.
 async function resolveForItem(cfg, item) {
-  const key = streamKey(cfg.apiKey, item.infohash || item.torrentUrl || item.name);
+  const key = streamKey(cfg.apiKey, item.infohash || item.torrentUrl || item.detailUrl || item.name);
   const cachedStreams = streamCache.get(key);
   if (cachedStreams) return { ready: true, status: "ok", streams: cachedStreams };
 
+  item = await resolveAudiobookItem(cfg, item);
   const result = await torbox.resolveStreams(cfg.apiKey, {
     magnet: item.magnet,
     infohash: item.infohash,
