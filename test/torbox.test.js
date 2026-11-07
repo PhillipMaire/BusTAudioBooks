@@ -93,3 +93,21 @@ test("waiting messages follow TorBox's own state", () => {
   assert.match(torbox.waitingStatus({ download_state: "metaDL" }), /fetching this torrent's details/);
   assert.match(torbox.waitingStatus({ progress: 0.1, download_state: "paused" }), /Resume it on torbox.app/);
 });
+
+test('a selected torrent returned as an array resolves to audio instead of a false downloading state', async () => {
+  const realFetch = global.fetch;
+  global.fetch = async (url) => {
+    const u = new URL(url);
+    let data;
+    if (u.pathname.endsWith('/mylist')) data = u.searchParams.has('id') ? [finished(99, H1, 'Book')] : [];
+    else if (u.pathname.endsWith('/createtorrent')) data = { torrent_id: 99, hash: H1 };
+    else if (u.pathname.endsWith('/requestdl')) data = 'https://audio.test/book.mp3';
+    else throw new Error('Unexpected TorBox request');
+    return { ok: true, json: async () => ({ success: true, data }) };
+  };
+  try {
+    const result = await torbox.resolveStreams('fixture-key', { infohash: H1, name: 'Book' });
+    assert.equal(result.ready, true);
+    assert.equal(result.streams[0].url, 'https://audio.test/book.mp3');
+  } finally { global.fetch = realFetch; }
+});

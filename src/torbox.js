@@ -223,7 +223,12 @@ async function getMyList(apiKey, { id } = {}) {
     query: { bypass_cache: "true", id },
   });
   if (!json || !json.success) return id !== undefined ? null : [];
-  return json.data; // array, or single object when id is provided
+  // TorBox deployments can return a one-element array even for an id filter.
+  // Treat the selection as a torrent, not as a perpetually unready array.
+  if (id !== undefined && Array.isArray(json.data)) {
+    return json.data.find(t => String(t.id) === String(id)) || null;
+  }
+  return json.data;
 }
 
 function filesReady(t) {

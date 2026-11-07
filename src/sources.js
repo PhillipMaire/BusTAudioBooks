@@ -10,6 +10,7 @@
 //
 // `searchAudiobooks(config, query)` is the only function index.js calls.
 
+const { enabledSources, searchPublic, NAMES } = require('./publicSources');
 const { TTLCache, pLimit, withRetry } = require("./cache");
 
 const BROWSER_UA =
@@ -21,6 +22,8 @@ const BROWSER_UA =
 const listCache = new TTLCache(5 * 60 * 1000, 200); // search pages, 5 min
 const detailCache = new TTLCache(60 * 60 * 1000, 1000); // detail pages, 1 h
 const limitAbb = pLimit(5); // at most 5 concurrent ABB fetches
+const pacedAbb = pLimit(1);
+let lastAbbRequest = 0;
 
 const AUDIOBOOK_CATEGORIES = []; // empty = don't filter; rely on the indexer being audiobook-only
 
@@ -78,6 +81,7 @@ function qualityScore(item) {
 // configurable (per-user in the configure page, or via the ABB_DOMAIN env var)
 // so you can point at the current working one without editing code.
 function abbDomain(config) {
+  if (process.env.ABB_ENABLED === "0") return null;
   const raw = (config.abbDomain || process.env.ABB_DOMAIN || "").trim();
   if (!raw) return null;
   return raw.replace(/^https?:\/\//, "").replace(/\/+$/, "");
@@ -88,6 +92,7 @@ async function abbFetchRaw(url) {
     async () => {
       const res = await fetch(url, {
         headers: { "User-Agent": BROWSER_UA, Accept: "text/html" },
+        signal: AbortSignal.timeout(12000),
       });
       if (!res.ok) throw new Error(`ABB HTTP ${res.status} for ${url}`);
       const text = await res.text();
@@ -107,7 +112,14 @@ function abbFetch(url, cache) {
     const hit = cache.get(url);
     if (hit !== undefined) return Promise.resolve(hit);
   }
-  return limitAbb(abbFetchRaw)(url).then((text) => {
+  const interval = Math.max(0, Number(process.env.ABB_REQUEST_INTERVAL_MS) || 0);
+  const request = interval ? pacedAbb(async () => {
+    const wait = lastAbbRequest + interval - Date.now();
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+    lastAbbRequest = Date.now();
+    return abbFetchRaw(url);
+  })() : limitAbb(abbFetchRaw)(url);
+  return request.then((text) => {
     if (cache) cache.set(url, text);
     return text;
   });
@@ -194,7 +206,7 @@ function buildMagnet(infohash, trackers, name) {
   return `magnet:?xt=urn:btih:${infohash}${dn}${tr}`;
 }
 
-async function searchAudiobookBay(config, query, page = 1) {
+async function searchAudiobookBay(config, query, page = 1, { deferDetails = false } = {}) {
   const domain = abbDomain(config);
   if (!domain) return []; // not configured
 
@@ -204,7 +216,20 @@ async function searchAudiobookBay(config, query, page = 1) {
   // (e.g. a Cloudflare challenge) instead of caching an empty answer.
   const listHtml = await abbFetch(listUrl, listCache);
 
-  const posts = parseAbbList(listHtml, domain).slice(0, 12); // cap detail fetches
+  const posts = parseAbbList(listHtml, domain);
+  // Follow the site's pagination, not the number of usable detail results.
+  // Filtering or a missing hash can make even a middle page look short.
+  const hasMore = [...listHtml.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)].some((match) => {
+    try {
+      const url = new URL(match[1].replace(/&amp;/g, '&'), listUrl);
+      if (url.hostname !== domain) return false;
+      const number = Number(url.pathname.match(/\/page\/(\d+)\/?$/)?.[1] || url.searchParams.get('paged'));
+      return number > page;
+    } catch (_) { return false; }
+  });
+  if (deferDetails) {
+    return Object.assign(posts.map(p => ({ name: p.title, detailUrl: p.detailUrl, tracker: 'AudiobookBay', seeders: 0 })), { hasMore });
+  }
 
   const settled = await Promise.allSettled(
     posts.map(async (p) => {
@@ -224,9 +249,24 @@ async function searchAudiobookBay(config, query, page = 1) {
     })
   );
 
-  return settled
+  const results = settled
     .filter((r) => r.status === "fulfilled" && r.value)
     .map((r) => r.value);
+  return Object.assign(results, { hasMore });
+}
+
+// Catalogs can carry a detail link instead of scraping every book up front.
+// Resolve only the selected book, and only on the configured source's origin.
+async function resolveAudiobookItem(config, item) {
+  if (item.infohash || !item.detailUrl) return item;
+  const url = new URL(item.detailUrl);
+  const base = new URL('https://' + abbDomain(config));
+  if (url.origin !== base.origin || !/^\/(abss|audio-books)\//.test(url.pathname)) {
+    throw new Error('Book detail URL does not belong to the configured source');
+  }
+  const details = parseAbbDetail(await abbFetch(url.href, detailCache));
+  if (!details.infohash) throw new Error('Book detail page has no info hash');
+  return { ...item, ...details, magnet: buildMagnet(details.infohash, details.trackers, item.name) };
 }
 
 // ===========================================================================
@@ -304,7 +344,7 @@ async function searchJackett(config, query, categories = AUDIOBOOK_CATEGORIES) {
 function dedupeAndSort(all) {
   const byKey = new Map();
   for (const item of all) {
-    const key = item.infohash || item.torrentUrl || item.magnet || item.name;
+    const key = item.infohash || item.torrentUrl || item.magnet || item.detailUrl || item.name;
     const existing = byKey.get(key);
     if (!existing || item.seeders > existing.seeders || (!existing.size && item.size)) {
       byKey.set(key, item);
@@ -328,39 +368,48 @@ async function runSources(sources) {
   const settled = await Promise.allSettled(sources.map(([, run]) => run()));
   const items = [];
   const failures = [];
+  const statuses = [];
+  let hasMore = false;
   settled.forEach((r, i) => {
-    if (r.status === "fulfilled") items.push(...r.value);
+    if (r.status === "fulfilled") {
+      items.push(...r.value);
+      statuses.push({ name: sources[i][0], status: "ok", count: r.value.length });
+      hasMore ||= r.value.hasMore === true;
+    }
     else {
       const reason = (r.reason && r.reason.message) || "failed";
       console.error(`${sources[i][0]} search failed:`, reason);
       failures.push(`${sources[i][0]}: ${reason}`);
+      statuses.push({ name: sources[i][0], status: "unavailable", count: 0 });
     }
   });
   if (failures.length > 0 && failures.length === sources.length) {
     throw new SearchUnavailableError(`Search is unavailable right now — ${failures.join("; ")}`);
   }
-  return { items: dedupeAndSort(items), partial: failures.length > 0 };
+  return { items: dedupeAndSort(items), partial: failures.length > 0, hasMore, statuses };
 }
 
 // Result arrays carry `partial: true` when some (not all) sources failed, so
 // the caller can cache them only briefly.
-async function searchAudiobooks(config, query, page = 1) {
+async function searchAudiobooks(config, query, page = 1, options = {}) {
   const abb = !!abbDomain(config);
   const jackett = !!jackettSettings(config);
-  if (!abb && !jackett) {
+  const publicSources = enabledSources(config);
+  if (!abb && !jackett && !publicSources.length) {
     throw new SearchUnavailableError("No search source is set up — add an AudiobookBay domain or Jackett/Prowlarr on the configure page.");
   }
-  const sources = [];
-  if (abb) sources.push(["AudiobookBay", () => searchAudiobookBay(config, query, page)]);
+  const sources = publicSources.filter(id => page === 1 || id === 'knaben').map(id => [NAMES[id], () => searchPublic(id, query, page)]);
+  if (abb) sources.push(["AudiobookBay", () => searchAudiobookBay(config, query, page, options)]);
   if (jackett && page === 1) sources.push(["Jackett", () => searchJackett(config, query)]);
   if (sources.length === 0) return []; // Jackett-only results aren't paginated
-  const { items, partial } = await runSources(sources);
-  return Object.assign(items, { partial });
+  const { items, partial, hasMore, statuses } = await runSources(sources);
+  return Object.assign(items, { partial, hasMore, statuses });
 }
 
 
 module.exports = {
   searchAudiobooks,
+  resolveAudiobookItem,
   SearchUnavailableError,
   qualityScore,
   // exported for testing
