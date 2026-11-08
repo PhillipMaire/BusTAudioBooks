@@ -12,6 +12,8 @@ const { TTLCache, pLimit, withTimeout } = require("./cache");
 const { makeAccess } = require("./access");
 const { createCatalogPager } = require("./catalog");
 const torbox = require("./torbox");
+const { relevance, normalizedQuery } = require("./searchQuery");
+const { installDownloads } = require("./downloads");
 
 const app = express();
 const path = require('path');
@@ -236,7 +238,7 @@ async function runSearch(cfg, query, page, { enrichResults = true, deferDetails 
     cfg.abbDomain || process.env.ABB_DOMAIN || '', effJackett,
     cfg.jackettApiKey || process.env.JACKETT_API_KEY || '', cfg.apiKey,
     process.env.PUBLIC_SOURCES || '', cfg.sources, process.env.ABB_ENABLED,
-    instantOnly, query, page, deferDetails,
+    instantOnly, normalizedQuery(query), page, deferDetails,
   ])).digest('hex');
   // The cache holds the expensive part (sources + TorBox cache check) without
   // covers; covers come from their own cache on every call.
@@ -261,6 +263,8 @@ async function runSearch(cfg, query, page, { enrichResults = true, deferDetails 
   if (instantOnly) results = results.filter((r) => r.infohash && cachedSet.has(r.infohash));
 
   results.sort((a, b) => {
+    const match = relevance(query, b.name) - relevance(query, a.name);
+    if (match) return match;
     const ca = a.infohash && cachedSet.has(a.infohash) ? 1 : 0;
     const cb = b.infohash && cachedSet.has(b.infohash) ? 1 : 0;
     if (ca !== cb) return cb - ca;
@@ -522,6 +526,7 @@ async function handleAppStreams(req, res) {
 }
 app.get("/:config/app/streams/:id", handleAppStreams);
 app.post("/api/streams", handleAppStreams);
+installDownloads(app, { getConfig, resolveForItem, decodeItemId });
 
 // GET /:config/app/details/:id -> synopsis, genre and year for the book page.
 // Best-effort and cached; every field may be null.

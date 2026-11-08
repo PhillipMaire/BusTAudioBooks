@@ -234,3 +234,23 @@ Public API contracts: [Knaben](https://github.com/knaben-database/knaben-api),
 Search results are torrent listings, not a promise of cached audio. With a key,
 cached results are marked; selecting an uncached book can require TorBox to
 prepare it. Archived releases without playable audio files cannot stream.
+
+### Downloads and forgiving search (3.4.0)
+
+Each search result has **Listen** and **Download** actions. Downloading never
+requires starting playback. A single-file release downloads directly; multi-file
+releases show a Download button for each file, plus Download file for the selected
+part. Downloads save to the browser's device with a real attachment filename.
+The Pi relays bytes with backpressure, without buffering the whole book or writing
+media to disk. Server-issued links expire after 15 minutes and can forward byte
+ranges; generate a fresh link by choosing Download again. API keys stay in POST
+bodies and are never included in download URLs. Arbitrary client target URLs are
+not accepted.
+
+Search normalizes curly/straight/missing apostrophes, case, accents and separators.
+Knaben uses generated, escaped prefix and one-edit fuzzy terms, including contraction
+alternatives, and the source's relevance order. Closer title/phrase matches sort
+before cached status, audio quality and seeders. Existing source pagination and
+failure reporting remain. For example, `youre joking` and `you're joking` share
+one query identity; `harry pott` and `harry pottr` can retrieve Harry Potter.
+Other sources receive normalized literal queries and familiar contractions.

@@ -1,4 +1,5 @@
 // Public search adapters; TorBox remains the resolver, not the search engine.
+const { normalizedQuery, literalQuery, flexibleQuery } = require('./searchQuery');
 const { TTLCache, withRetry } = require('./cache');
 const pages = new TTLCache(5 * 60 * 1000, 100);
 const PAGE_SIZE = 100;
@@ -18,7 +19,7 @@ function normalize(r, tracker) {
     seeders: Math.max(0, Number(r.seeders) || 0), tracker, format: name.match(/\b(mp3|m4b|m4a|flac|aac|opus)\b/i)?.[1]?.toUpperCase() || null };
 }
 async function searchPublic(source, query, page = 1) {
-  const key = JSON.stringify([source, query, page]);
+  const key = JSON.stringify([source, normalizedQuery(query), page]);
   const hit = pages.get(key);
   if (hit) return hit;
   if (source !== 'knaben' && page > 1) return Object.assign([], { hasMore: false });
@@ -26,14 +27,14 @@ async function searchPublic(source, query, page = 1) {
   if (source === 'knaben') {
     url = 'https://api.knaben.org/v1';
     init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-      search_type: '100%', search_field: 'title', query, categories: [1003000],
-      order_by: 'seeders', order_direction: 'desc', from: (page - 1) * PAGE_SIZE,
+      search_type: '100%', search_field: 'title', query: flexibleQuery(query), categories: [1003000],
+      from: (page - 1) * PAGE_SIZE,
       size: PAGE_SIZE, hide_unsafe: true, hide_xxx: true,
     }) };
   } else if (source === 'tpb') {
-    url = 'https://apibay.org/q.php?' + new URLSearchParams({ q: query, cat: '102' });
+    url = 'https://apibay.org/q.php?' + new URLSearchParams({ q: literalQuery(query), cat: '102' });
   } else if (source === 'torrentscsv') {
-    url = 'https://torrents-csv.com/service/search?' + new URLSearchParams({ q: query, size: '100' });
+    url = 'https://torrents-csv.com/service/search?' + new URLSearchParams({ q: literalQuery(query), size: '100' });
   } else { throw new Error('Unknown public source'); }
   const json = await withRetry(async () => {
     const res = await fetch(url, { ...init, headers: { ...init.headers, 'User-Agent': 'BusTAudioBooks/3.3 (+https://github.com/PhillipMaire/BusTAudioBooks)' }, signal: AbortSignal.timeout(15000) });

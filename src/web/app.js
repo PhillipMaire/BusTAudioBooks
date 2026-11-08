@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let page = 1, query = '', busy = false, seen = new Set(), count = 0, currentBook = null, files = [], searchConfig = null;
-let activeFile = '', lastSaved = 0, playGeneration = 0;
+let activeFile = '', lastSaved = 0, playGeneration = 0, downloadMode = false;
 const config = () => ({ apiKey: $('api-key').value.trim(), token: $('token').value.trim(),
   instantOnly: $('instant-only').checked, sources: [...$('sources').querySelectorAll('input:checked')].map(el => el.value) });
 function keyChanged() { $('key-state').textContent = $('api-key').value.trim() ? '· key ready in this tab' : '· add your key to play'; }
@@ -44,7 +44,11 @@ function renderBook(book) {
   title.textContent = book.title;
   subtitle.textContent = [book.cached ? '⚡ Cached on TorBox' : 'TorBox cache not confirmed', book.source, book.format, book.sizeText, book.seeders + ' seeders'].filter(Boolean).join(' · ');
   play.type = 'button'; play.textContent = 'Listen'; play.addEventListener('click', () => playBook(book));
-  copy.append(title, subtitle); row.append(icon, copy, play); $('results').append(row);
+  const download = document.createElement('button');
+  download.type = 'button'; download.className = 'secondary'; download.textContent = 'Download';
+  download.addEventListener('click', () => playBook(book, true));
+  const actions = document.createElement('div'); actions.className = 'book-actions'; actions.append(play, download);
+  copy.append(title, subtitle); row.append(icon, copy, actions); $('results').append(row);
 }
 async function search(more = false) {
   if (busy) return;
@@ -77,13 +81,14 @@ function chooseFile(index) {
   $('audio').src = file.url; $('audio').playbackRate = Number($('speed').value);
   $('download').href = file.url; $('parts').value = String(index);
   $('audio').load();
-  $('audio').play().catch(() => { $('playback-status').textContent = 'Ready. Press play to start listening.'; });
+  if (!downloadMode) $('audio').play().catch(() => { $('playback-status').textContent = 'Ready. Press play to start listening.'; });
 }
-async function playBook(book) {
+async function playBook(book, forDownload = false) {
   const cfg = config();
-  if (!cfg.apiKey) { $('connection').open = true; $('api-key').focus(); $('status').textContent = 'Add your TorBox key above, then choose Listen again.'; return; }
-  saveProgress(); $('audio').pause(); currentBook = book;
+  if (!cfg.apiKey) { $('connection').open = true; $('api-key').focus(); $('status').textContent = 'Add your TorBox key above, then choose Listen or Download again.'; return; }
+  saveProgress(); $('audio').pause(); currentBook = book; downloadMode = forDownload;
   const generation = ++playGeneration;
+  $('save-file').disabled = true; $('download-status').textContent = ''; $('download-files').replaceChildren(); $('download-files').hidden = true;
   $('playback').hidden = false; $('book-title').textContent = book.title;
   $('playback-status').textContent = 'Asking TorBox for playable files…'; $('retry').hidden = true;
   $('parts-label').hidden = true; $('audio').removeAttribute('src'); $('audio').load(); $('download').removeAttribute('href'); activeFile = '';
@@ -98,10 +103,37 @@ async function playBook(book) {
     $('parts').replaceChildren(...files.map((file, i) => { const option = document.createElement('option'); option.value = i; option.textContent = file.filename || file.title || 'Part ' + (i + 1); return option; }));
     $('parts-label').hidden = files.length < 2;
     $('playback-status').textContent = files.length + ' audio file' + (files.length === 1 ? '' : 's') + ' ready from TorBox.';
+    $('save-file').disabled = false;
+    if (files.length > 1) {
+      $('download-files').hidden = false;
+      for (let i = 0; i < files.length; i++) {
+        const row = document.createElement('div'), label = document.createElement('span'), button = document.createElement('button');
+        row.className = 'file-row'; label.textContent = files[i].filename || files[i].title || 'Part ' + (i + 1);
+        button.type = 'button'; button.textContent = 'Download'; button.addEventListener('click', () => downloadFile(i, button));
+        row.append(label, button); $('download-files').append(row);
+      }
+    }
     chooseFile(0);
+    if (forDownload && files.length === 1) await downloadFile(0, $('save-file'));
+    else if (forDownload) $('download-status').textContent = 'This release has ' + files.length + ' files. Choose the file(s) you want to save below.';
   } catch (err) { if (generation === playGeneration) { $('playback-status').textContent = err.message; $('retry').hidden = false; } }
 }
-$('retry').addEventListener('click', () => currentBook && playBook(currentBook));
+$('retry').addEventListener('click', () => currentBook && playBook(currentBook, downloadMode));
+async function downloadFile(index, button) {
+  const book = currentBook;
+  if (!book || !files[index]) return;
+  button.disabled = true;
+  $('download-status').textContent = 'Preparing download…';
+  try {
+    const data = await api('download', { config: config(), id: book.id, index });
+    if (!/^\/api\/download\/[a-f0-9]{64}$/.test(data.url)) throw new Error('Invalid download link');
+    const link = document.createElement('a'); link.href = data.url; link.download = data.filename || 'audiobook';
+    link.hidden = true; document.body.append(link); link.click(); link.remove();
+    $('download-status').textContent = 'Download started. Check your browser’s downloads.';
+  } catch (err) { $('download-status').textContent = err.message; }
+  finally { button.disabled = false; }
+}
+$('save-file').addEventListener('click', () => downloadFile(Number($('parts').value), $('save-file')));
 $('parts').addEventListener('change', () => chooseFile(Number($('parts').value)));
 $('speed').addEventListener('change', () => { $('audio').playbackRate = Number($('speed').value); });
 $('back').addEventListener('click', () => { $('audio').currentTime = Math.max(0, $('audio').currentTime - 30); });
@@ -113,7 +145,7 @@ $('audio').addEventListener('loadedmetadata', () => {
 $('audio').addEventListener('timeupdate', () => { if (Date.now() - lastSaved > 5000) { saveProgress(); lastSaved = Date.now(); } });
 $('audio').addEventListener('pause', saveProgress);
 $('audio').addEventListener('ended', () => { try { localStorage.removeItem('bustaudio-progress:' + activeFile); } catch (_) {} activeFile = ''; const next = Number($('parts').value) + 1; if (next < files.length) chooseFile(next); });
-$('audio').addEventListener('error', () => { $('playback-status').textContent = 'This file could not play in your browser. Try Open / download file, or check TorBox again for a fresh link.'; $('retry').hidden = false; });
+$('audio').addEventListener('error', () => { $('playback-status').textContent = 'This file could not play in your browser. Try Download file or Open in audio player, or check TorBox again for a fresh link.'; $('retry').hidden = false; });
 window.addEventListener('pagehide', saveProgress);
 fetch('/api/sources').then(r => r.json()).then(data => {
   for (const source of data.sources) { const label = document.createElement('label'), input = document.createElement('input'); input.type = 'checkbox'; input.value = source.id; input.checked = true; label.append(input, document.createTextNode(source.name)); $('sources').append(label); }
